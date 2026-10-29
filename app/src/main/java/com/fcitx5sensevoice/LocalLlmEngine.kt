@@ -9,12 +9,10 @@ import com.google.ai.edge.litertlm.ConversationConfig
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
 import com.google.ai.edge.litertlm.SamplerConfig
-import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import java.io.File
 
 class LocalLlmEngine(private val context: Context) {
     private var litertEngine: Engine? = null
-    private var mediapipeInference: LlmInference? = null
     private var loadedModelPath: String? = null
 
     fun findModelFile(): File? {
@@ -46,15 +44,15 @@ class LocalLlmEngine(private val context: Context) {
     private fun isModelFile(file: File): Boolean {
         if (!file.isFile || file.length() < 1024 * 1024) return false
         val name = file.name.lowercase()
-        return name.endsWith(".litertlm") || name.endsWith(".task") || name.endsWith(".bin")
+        return name.endsWith(".litertlm")
     }
 
     @Synchronized
     fun ensureInitialized(): File {
         val modelFile = findModelFile()
-            ?: throw IllegalStateException("未找到本地大模型文件，请点左下角[📂选模型]选择已下载的 .litertlm 或 .task 模型")
+            ?: throw IllegalStateException("未找到本地大模型文件，请点左下角[📂选模型]选择已下载的 .litertlm 模型")
 
-        if (loadedModelPath == modelFile.absolutePath && (litertEngine != null || mediapipeInference != null)) {
+        if (loadedModelPath == modelFile.absolutePath && litertEngine != null) {
             return modelFile
         }
 
@@ -62,23 +60,14 @@ class LocalLlmEngine(private val context: Context) {
         val path = modelFile.absolutePath
         Log.i(TAG, "Initializing local LLM from $path")
 
-        if (path.lowercase().endsWith(".litertlm")) {
-            val config = EngineConfig(
-                modelPath = path,
-                backend = Backend.CPU(),
-                cacheDir = context.cacheDir.path,
-            )
-            val engine = Engine(config)
-            engine.initialize()
-            litertEngine = engine
-        } else {
-            val options = LlmInference.LlmInferenceOptions.builder()
-                .setModelPath(path)
-                .setMaxTokens(1024)
-                .build()
-            mediapipeInference = LlmInference.createFromOptions(context, options)
-        }
-
+        val config = EngineConfig(
+            modelPath = path,
+            backend = Backend.CPU(),
+            cacheDir = context.cacheDir.path,
+        )
+        val engine = Engine(config)
+        engine.initialize()
+        litertEngine = engine
         loadedModelPath = path
         return modelFile
     }
@@ -111,24 +100,15 @@ class LocalLlmEngine(private val context: Context) {
     }
 
     private fun runGeneration(systemPrompt: String, userPrompt: String): String {
-        litertEngine?.let { engine ->
-            val convConfig = ConversationConfig(
-                systemInstruction = Contents.of(systemPrompt),
-                samplerConfig = SamplerConfig(topK = 20, topP = 0.9, temperature = 0.2),
-            )
-            engine.createConversation(convConfig).use { conversation ->
-                val reply = conversation.sendMessage(userPrompt)
-                return cleanModelOutput(reply.toString())
-            }
+        val engine = litertEngine ?: throw IllegalStateException("本地大模型尚未就绪")
+        val convConfig = ConversationConfig(
+            systemInstruction = Contents.of(systemPrompt),
+            samplerConfig = SamplerConfig(topK = 20, topP = 0.9, temperature = 0.2),
+        )
+        engine.createConversation(convConfig).use { conversation ->
+            val reply = conversation.sendMessage(userPrompt)
+            return cleanModelOutput(reply.toString())
         }
-
-        mediapipeInference?.let { inference ->
-            val combinedPrompt = "$systemPrompt\n\n$userPrompt"
-            val reply = inference.generateResponse(combinedPrompt)
-            return cleanModelOutput(reply ?: "")
-        }
-
-        throw IllegalStateException("本地大模型尚未就绪")
     }
 
     private fun cleanModelOutput(raw: String): String {
@@ -142,9 +122,7 @@ class LocalLlmEngine(private val context: Context) {
     @Synchronized
     fun release() {
         runCatching { litertEngine?.close() }
-        runCatching { mediapipeInference?.close() }
         litertEngine = null
-        mediapipeInference = null
         loadedModelPath = null
     }
 

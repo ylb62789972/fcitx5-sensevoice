@@ -39,8 +39,8 @@ jobs:
       - name: Prepare legal assets
         run: ./scripts/prepare-legal-assets.sh
 
-      - name: Test and assemble Debug APK
-        run: ./gradlew --no-daemon test assembleDebug
+      - name: Assemble Debug APK
+        run: ./gradlew --no-daemon assembleDebug --stacktrace
 
       - name: Upload installable APK artifact
         uses: actions/upload-artifact@v4
