@@ -18,8 +18,8 @@ android {
         applicationId = "com.fcitx5sensevoice"
         minSdk = 28
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.2.1-eg"
+        versionCode = 11
+        versionName = "0.2.2-eg"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -69,12 +69,14 @@ android {
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+        freeCompilerArgs.add("-Xskip-metadata-version-check")
     }
 }
 
 dependencies {
     implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("androidx.activity:activity:1.13.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("com.google.android.material:material:1.14.0")

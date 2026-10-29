@@ -40,7 +40,18 @@ jobs:
         run: ./scripts/prepare-legal-assets.sh
 
       - name: Assemble Debug APK
-        run: ./gradlew --no-daemon assembleDebug --stacktrace
+        run: |
+          if ! ./gradlew --no-daemon assembleDebug --stacktrace > build.log 2>&1; then
+            echo "### Gradle Build Error Log" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep -E "e: |FAILURE:|What went wrong|Caused by:" -A 5 build.log | head -n 80 >> $GITHUB_STEP_SUMMARY || true
+            echo "--- Tail of build.log ---" >> $GITHUB_STEP_SUMMARY
+            tail -n 80 build.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat build.log
+            exit 1
+          fi
+          cat build.log
 
       - name: Upload installable APK artifact
         uses: actions/upload-artifact@v4
