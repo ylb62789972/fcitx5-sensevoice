@@ -1,5 +1,4 @@
 from pathlib import Path
-import copy
 import xml.etree.ElementTree as ET
 
 root = Path(__file__).resolve().parent.parent
@@ -41,8 +40,8 @@ s = p.read_text()
 s = s.replace('findViewById<Button>', 'findViewById<View>')
 anchor = 'view.findViewById<ImageButton>(R.id.enter).setOnClickListener { sendEnterOrEditorAction() }'
 assert s.count(anchor) == 1, 'Keyboard changed; review before applying'
-s = s.replace(anchor, anchor + '\n            view.findViewById<View>(R.id.btn_polish_zh).setOnClickListener {\n                translateAndCommit("Simplified Chinese: polish the original Chinese, remove filler and repetition, improve grammar without changing meaning")\n            }'.replace('\n','
-'))
+listener = chr(10).join(['', '            view.findViewById<View>(R.id.btn_polish_zh).setOnClickListener {', '                translateAndCommit("Simplified Chinese: polish the original Chinese, remove filler and repetition, improve grammar without changing meaning")', '            }'])
+s = s.replace(anchor, anchor + listener)
 needle = 'currentInputConnection?.commitText(translated, 1)'
 assert s.count(needle) == 1, 'Translation commit changed; review required'
 s = s.replace(needle, '// Preview only: user explicitly inserts the reviewed draft.')
