@@ -1,11 +1,13 @@
 package com.fcitx5sensevoice
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.View
 import android.widget.AdapterView
@@ -15,13 +17,17 @@ import android.widget.Button
 import android.widget.ImageView
 import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.app.AppCompatDelegate
 import com.google.android.material.materialswitch.MaterialSwitch
+import java.io.File
+import java.util.concurrent.Executors
 
 class SettingsActivity : AppCompatActivity() {
     private val settingsStore by lazy { AppSettings(this) }
+    private val copyExecutor = Executors.newSingleThreadExecutor()
     private lateinit var uiLanguageSpinner: Spinner
     private lateinit var uiThemeSpinner: Spinner
     private lateinit var languageSpinner: Spinner
@@ -39,8 +45,15 @@ class SettingsActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { renderPermissionState() }
 
+    private val modelFilePicker = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            importSelectedModelFile(uri)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        // Process-wide default: a fresh process starts in MODE_NIGHT_UNSPECIFIED, so every activity sets it.
         AppCompatDelegate.setDefaultNightMode(settingsStore.loadUiTheme().appCompatMode)
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
@@ -58,12 +71,59 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<View>(R.id.settings_back).setOnClickListener { finish() }
         findViewById<View>(R.id.advanced_toggle).setOnClickListener { toggleAdvancedSettings() }
 
-        if (
-            savedInstanceState == null &&
-            intent.getBooleanExtra(EXTRA_REQUEST_MICROPHONE_PERMISSION, false) &&
-            !hasPermission()
-        ) {
-            requestMicrophonePermission()
+        if (savedInstanceState == null) {
+            if (intent.getBooleanExtra(EXTRA_REQUEST_MICROPHONE_PERMISSION, false) && !hasPermission()) {
+                requestMicrophonePermission()
+            }
+            if (intent.getBooleanExtra(EXTRA_IMPORT_LLM_MODEL, false)) {
+                Toast.makeText(this, "请选择手机中已下载的 .litertlm 或 .task 本地模型文件", Toast.LENGTH_LONG).show()
+                modelFilePicker.launch(arrayOf("*/*"))
+            }
+        }
+    }
+
+    private fun importSelectedModelFile(uri: Uri) {
+        Toast.makeText(this, "正在导入本地大模型到键盘专用目录，请稍候...", Toast.LENGTH_LONG).show()
+        copyExecutor.execute {
+            try {
+                val fileName = queryDisplayName(uri) ?: "model.litertlm"
+                val targetDir = File(filesDir, "llm_models").apply { mkdirs() }
+                targetDir.listFiles()?.forEach { it.delete() }
+                val targetFile = File(targetDir, fileName)
+                contentResolver.openInputStream(uri)?.use { input ->
+                    targetFile.outputStream().use { output ->
+                        input.copyTo(output, bufferSize = 1024 * 1024)
+                    }
+                } ?: error("无法读取所选文件")
+
+                getSharedPreferences(LocalLlmEngine.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(LocalLlmEngine.KEY_MODEL_PATH, targetFile.absolutePath)
+                    .apply()
+
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "本地模型已成功导入：${targetFile.name}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                    finish()
+                }
+            } catch (e: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "导入模型失败：${e.message}",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        return contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
         }
     }
 
@@ -76,6 +136,11 @@ class SettingsActivity : AppCompatActivity() {
     override fun onPause() {
         settingsStore.save(readSettings())
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        copyExecutor.shutdown()
+        super.onDestroy()
     }
 
     private fun bindViews() {
@@ -102,16 +167,7 @@ class SettingsActivity : AppCompatActivity() {
         endpointSilenceSpinner.setEntries(R.array.endpoint_silence_labels)
         uiLanguageSpinner.setSelection(UiLanguage.entries.indexOf(currentUiLanguage(this)))
         uiThemeSpinner.setSelection(UiTheme.entries.indexOf(settingsStore.loadUiTheme()))
-        uiLanguageSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                applyUiPreferences(
-                    language = UiLanguage.entries[position.coerceIn(UiLanguage.entries.indices)],
-                    theme = settingsStore.loadUiTheme(),
-                )
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
+        uiLanguageSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {\n            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {\n                applyUiPreferences(\n                    language = UiLanguage.entries[position.coerceIn(UiLanguage.entries.indices)],\n                    theme = settingsStore.loadUiTheme(),\n                )\n            }\n\n            override fun onNothingSelected(parent: AdapterView<*>?) = Unit\n        }
         uiThemeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 applyUiPreferences(
@@ -150,7 +206,6 @@ class SettingsActivity : AppCompatActivity() {
         ],
     )
 
-    // AppCompat recreates the activity itself when either the locales or the night mode change.
     private fun applyUiPreferences(language: UiLanguage, theme: UiTheme) {
         if (language != currentUiLanguage(this)) AppCompatDelegate.setApplicationLocales(language.toLocaleList())
         if (theme != settingsStore.loadUiTheme()) {
@@ -172,7 +227,6 @@ class SettingsActivity : AppCompatActivity() {
         renderStatus(imeStatusIcon, imeStatus, enabled, if (enabled) R.string.ime_enabled else R.string.ime_disabled)
     }
 
-    // Icon and text carry the state; colour only reinforces it for colour-blind users.
     private fun renderStatus(icon: ImageView, label: TextView, ok: Boolean, textRes: Int) {
         val color = getColor(if (ok) R.color.settings_status_ok else R.color.settings_status_warn)
         label.setText(textRes)
@@ -249,7 +303,8 @@ class SettingsActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_REQUEST_MICROPHONE_PERMISSION = "request_microphone_permission"
-        private const val GITHUB_REPOSITORY_URL = "https://github.com/stormrise/fcitx5-sensevoice"
+        const val EXTRA_IMPORT_LLM_MODEL = "import_llm_model"
+        private const val GITHUB_REPOSITORY_URL = "https://github.com/ylb62789972/fcitx5-sensevoice"
         private val VAD_THRESHOLDS = floatArrayOf(0.15f, AsrSettings.DEFAULT_VAD_THRESHOLD, 0.4f)
         private val ENDPOINT_SILENCE_SECONDS =
             floatArrayOf(0.5f, AsrSettings.DEFAULT_VAD_MIN_SILENCE_SECONDS, 1f, 1.5f)

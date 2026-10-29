@@ -18,8 +18,8 @@ android {
         applicationId = "com.fcitx5sensevoice"
         minSdk = 28
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.1.7"
+        versionCode = 9
+        versionName = "0.2.0-eg"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -62,7 +62,7 @@ android {
     }
 
     androidResources {
-        noCompress += "onnx"
+        noCompress += listOf("onnx", "litertlm", "task", "bin")
     }
 }
 
@@ -74,6 +74,8 @@ kotlin {
 
 dependencies {
     implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.16.1")
+    implementation("com.google.mediapipe:tasks-genai:0.10.27")
     implementation("androidx.activity:activity:1.13.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("com.google.android.material:material:1.14.0")

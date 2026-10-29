@@ -3,14 +3,17 @@ package com.fcitx5sensevoice
 import android.Manifest
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
-import android.content.res.Configuration
 import android.content.Intent
-import android.content.res.ColorStateList
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.inputmethodservice.InputMethodService
 import android.os.Handler
 import android.os.Looper
+import android.text.method.ScrollingMovementMethod
 import android.util.Log
 import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
@@ -21,9 +24,10 @@ import android.view.ViewConfiguration
 import android.view.animation.LinearInterpolator
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.widget.Button
 import android.widget.ImageButton
-import androidx.core.content.ContextCompat
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 
@@ -32,6 +36,11 @@ class VoiceInputMethodService : InputMethodService() {
     private val asrExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "fcitx5-sensevoice-asr")
     }
+    private val llmExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "eg-local-llm")
+    }
+    private val localLlmEngine by lazy { LocalLlmEngine(applicationContext) }
+
     private lateinit var statusView: TextView
     private lateinit var voiceWaveView: VoiceWaveView
     private lateinit var microphoneButton: ImageButton
@@ -39,6 +48,9 @@ class VoiceInputMethodService : InputMethodService() {
     private lateinit var hintView: TextView
     private lateinit var loadingSkeleton: View
     private lateinit var loadingSheen: View
+    private lateinit var draftPreview: TextView
+    private val draftBuffer = StringBuilder()
+
     private var sheenAnimator: ObjectAnimator? = null
     private var recordingStartedAtMs = 0L
     private var capturedSamples = 0
@@ -99,8 +111,6 @@ class VoiceInputMethodService : InputMethodService() {
         )
     }
 
-    // The service's own resources are frozen at creation, so a language or theme change in Settings
-    // never reaches them. Derive the UI context from the current preferences on every call.
     private fun uiContext(): Context = wrapUiTheme(ContextCompat.getContextForLanguage(applicationContext))
 
     override fun onCreate() {
@@ -112,7 +122,7 @@ class VoiceInputMethodService : InputMethodService() {
 
     override fun onCreateInputView(): View = inflateInputView()
 
-    override fun onStartInputView(info: android.view.inputmethod.EditorInfo?, restarting: Boolean) {
+    override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         refreshInputViewIfUiChanged()
         inputSession++
@@ -128,7 +138,6 @@ class VoiceInputMethodService : InputMethodService() {
         refreshInputViewIfUiChanged()
     }
 
-    // Rebuilding the panel would drop an in-progress recording, so defer language/night-mode switches until idle.
     private fun refreshInputViewIfUiChanged() {
         val uiLanguage = currentUiLanguage(this)
         val nightMode = uiContext().resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK
@@ -147,6 +156,11 @@ class VoiceInputMethodService : InputMethodService() {
             loadingSkeleton = view.findViewById(R.id.loading_skeleton)
             loadingSheen = view.findViewById(R.id.loading_sheen)
             voiceWaveView = view.findViewById(R.id.voice_wave)
+            draftPreview = view.findViewById<TextView>(R.id.draft_preview).apply {
+                movementMethod = ScrollingMovementMethod()
+                text = draftBuffer.toString()
+            }
+
             view.findViewById<ImageButton>(R.id.back).setOnClickListener {
                 returnToPreviousInputMethod()
             }
@@ -162,8 +176,211 @@ class VoiceInputMethodService : InputMethodService() {
                 setOnTouchListener(::onMicrophoneTouch)
             }
             view.findViewById<ImageButton>(R.id.enter).setOnClickListener { sendEnterOrEditorAction() }
+
+            // 剪贴板与常用词条按钮
+            view.findViewById<Button>(R.id.btn_paste_translate_zh).setOnClickListener {
+                pasteAndTranslateToChinese()
+            }
+            view.findViewById<Button>(R.id.btn_paste_draft).setOnClickListener {
+                pasteClipboardToDraft()
+            }
+            view.findViewById<Button>(R.id.btn_quick_snippet).apply {
+                setOnClickListener { insertSavedSnippet() }
+                setOnLongClickListener {
+                    saveCurrentDraftAsSnippet()
+                    true
+                }
+            }
+            view.findViewById<Button>(R.id.btn_copy_draft).setOnClickListener {
+                copyDraftToClipboard()
+            }
+            view.findViewById<Button>(R.id.btn_clear_draft).setOnClickListener {
+                clearDraft()
+            }
+            view.findViewById<Button>(R.id.btn_paste_direct).setOnClickListener {
+                pasteDirectlyToEditor()
+            }
+            view.findViewById<Button>(R.id.btn_import_model).setOnClickListener {
+                openModelImportActivity()
+            }
+
+            // 五国语言上屏按钮
+            view.findViewById<Button>(R.id.btn_commit_zh).setOnClickListener {
+                commitDraftDirectly()
+            }
+            view.findViewById<Button>(R.id.btn_translate_el).setOnClickListener {
+                translateAndCommit("Greek (Ελληνικά)")
+            }
+            view.findViewById<Button>(R.id.btn_translate_en).setOnClickListener {
+                translateAndCommit("English")
+            }
+            view.findViewById<Button>(R.id.btn_translate_ar).setOnClickListener {
+                translateAndCommit("Arabic (العربية)")
+            }
+            view.findViewById<Button>(R.id.btn_translate_tr).setOnClickListener {
+                translateAndCommit("Turkish (Türkçe)")
+            }
+
             renderIdleState()
         }
+
+    private fun readClipboardText(): String? {
+        val clipboard = getSystemService(ClipboardManager::class.java) ?: return null
+        val clip = clipboard.primaryClip ?: return null
+        if (clip.itemCount <= 0) return null
+        return clip.getItemAt(0).coerceToText(this)?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun pasteClipboardToDraft() {
+        val clipText = readClipboardText()
+        if (clipText == null) {
+            showStatus("剪贴板为空", "请先复制文本或银行账号")
+            return
+        }
+        if (draftBuffer.isNotEmpty() && !draftBuffer.endsWith(" ")) {
+            draftBuffer.append(" ")
+        }
+        draftBuffer.append(clipText)
+        updateDraftView()
+        showStatus("已粘贴进预览草稿", "核对无误后可点击上屏或翻译")
+    }
+
+    private fun pasteDirectlyToEditor() {
+        val clipText = readClipboardText()
+        if (clipText == null) {
+            showStatus("剪贴板为空", "请先复制内容")
+            return
+        }
+        currentInputConnection?.commitText(clipText, 1)
+        showStatus("已直接粘贴到输入框", "")
+    }
+
+    private fun copyDraftToClipboard() {
+        val content = draftBuffer.toString().trim()
+        if (content.isEmpty()) {
+            showStatus("预览框为空", "没有可复制的内容")
+            return
+        }
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard?.setPrimaryClip(ClipData.newPlainText("EG-AI-IME", content))
+        showStatus("已复制到手机剪贴板", "可直接去其他聊天窗口粘贴")
+    }
+
+    private fun clearDraft() {
+        draftBuffer.clear()
+        updateDraftView()
+        renderIdleState()
+    }
+
+    private fun insertSavedSnippet() {
+        val prefs = getSharedPreferences(LocalLlmEngine.PREFS_NAME, Context.MODE_PRIVATE)
+        val snippet = prefs.getString(LocalLlmEngine.KEY_CUSTOM_SNIPPET, LocalLlmEngine.DEFAULT_SNIPPET)
+            ?: LocalLlmEngine.DEFAULT_SNIPPET
+        if (draftBuffer.isNotEmpty() && !draftBuffer.endsWith(" ")) {
+            draftBuffer.append(" ")
+        }
+        draftBuffer.append(snippet)
+        updateDraftView()
+        showStatus("已插入常用词条", "长按[⭐常用词]可将当前草稿设为新常用词")
+    }
+
+    private fun saveCurrentDraftAsSnippet() {
+        val content = draftBuffer.toString().trim()
+        if (content.isEmpty()) {
+            showStatus("草稿为空", "请先输入或粘贴你的IBAN/抬头再长按保存")
+            return
+        }
+        getSharedPreferences(LocalLlmEngine.PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(LocalLlmEngine.KEY_CUSTOM_SNIPPET, content)
+            .apply()
+        showStatus("已保存为常用词条", "以后点[⭐常用词]即可一键插入")
+    }
+
+    private fun commitDraftDirectly() {
+        val content = draftBuffer.toString().trim()
+        if (content.isEmpty()) {
+            showStatus("预览框为空", "请先按麦克风说话或粘贴内容")
+            return
+        }
+        val committed = currentInputConnection?.commitText(content, 1) ?: false
+        if (committed) {
+            draftBuffer.clear()
+            updateDraftView()
+            showStatus("中文已上屏", "")
+        } else {
+            showStatus("无法写入当前输入框", "请先点击聊天软件输入框")
+        }
+    }
+
+    private fun pasteAndTranslateToChinese() {
+        val clipText = readClipboardText()
+        if (clipText == null) {
+            showStatus("剪贴板为空", "请先在聊天窗口长按复制租客发来的外语")
+            return
+        }
+        draftBuffer.clear()
+        draftBuffer.append(clipText)
+        updateDraftView()
+        showStatus("正在离线翻译租客消息...", "调用本机大模型译为中文", busy = true)
+        llmExecutor.execute {
+            try {
+                val zhResult = localLlmEngine.translateIncomingToChinese(clipText)
+                postToMain {
+                    draftBuffer.clear()
+                    draftBuffer.append(zhResult)
+                    updateDraftView()
+                    showStatus("租客消息已译为中文", "显示在上方预览框中，可点[📄复制]")
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "LLM_TRANSLATE_ZH_FAILED", error)
+                postToMain {
+                    showStatus("本地模型调用失败", error.message ?: "请点左下角[📂选模型]导入模型")
+                }
+            }
+        }
+    }
+
+    private fun translateAndCommit(targetLanguage: String) {
+        val sourceText = draftBuffer.toString().trim()
+        if (sourceText.isEmpty()) {
+            showStatus("预览框为空", "请先用麦克风说中文或粘贴内容")
+            return
+        }
+        showStatus("正在去口语并译为 $targetLanguage...", "首次唤醒本地模型约需2秒", busy = true)
+        llmExecutor.execute {
+            try {
+                val translated = localLlmEngine.translatePropertyMessage(sourceText, targetLanguage)
+                postToMain {
+                    draftBuffer.clear()
+                    draftBuffer.append(translated)
+                    updateDraftView()
+                    currentInputConnection?.commitText(translated, 1)
+                    showStatus("已译为 $targetLanguage 并填入输入框", "同时保留在预览框可点[📄复制]")
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "LLM_TRANSLATE_FAILED", error)
+                postToMain {
+                    showStatus("本地模型未就绪", error.message ?: "请点左下角[📂选模型]导入模型")
+                }
+            }
+        }
+    }
+
+    private fun openModelImportActivity() {
+        startActivity(
+            Intent(this, SettingsActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra(SettingsActivity.EXTRA_IMPORT_LLM_MODEL, true)
+            },
+        )
+    }
+
+    private fun updateDraftView() {
+        if (::draftPreview.isInitialized) {
+            draftPreview.text = draftBuffer.toString()
+        }
+    }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         inputViewActive = false
@@ -186,6 +403,10 @@ class VoiceInputMethodService : InputMethodService() {
             asrEngine = null
         }
         asrExecutor.shutdown()
+        llmExecutor.execute {
+            localLlmEngine.release()
+        }
+        llmExecutor.shutdown()
         mainHandler.removeCallbacksAndMessages(null)
         Log.i(TAG, "IME_DESTROYED")
         super.onDestroy()
@@ -292,10 +513,14 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     private fun deletePreviousCharacter() {
-        sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+        if (draftBuffer.isNotEmpty()) {
+            draftBuffer.deleteCharAt(draftBuffer.length - 1)
+            updateDraftView()
+        } else {
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+        }
     }
 
-    // Runs the field's own action (Send, Go, Search, Done) when it has one; otherwise inserts a new line.
     private fun sendEnterOrEditorAction() {
         val options = currentInputEditorInfo?.imeOptions ?: 0
         val action = options and EditorInfo.IME_MASK_ACTION
@@ -423,7 +648,12 @@ class VoiceInputMethodService : InputMethodService() {
             }
 
             else -> {
-                showStatus(text(R.string.status_ready), text(R.string.status_ready_hint))
+                val modelStatus = if (localLlmEngine.findModelFile() != null) {
+                    "离线语音+本地翻译模型就绪"
+                } else {
+                    "离线语音就绪（点左下角📂选翻译模型）"
+                }
+                showStatus(modelStatus, "点麦克风说话，先在预览框核对再点语言按钮")
                 setMicrophoneAppearance(recording = false, enabled = true)
             }
         }
@@ -529,7 +759,7 @@ class VoiceInputMethodService : InputMethodService() {
                         voiceState = VoiceState.RESULT
                         showStatus(text(R.string.status_empty_result), text(R.string.status_empty_result_hint))
                     } else if (committedSegments == recognizedSegments) {
-                        renderIdleState()
+                        showStatus("语音已转文字（请核对房号金额）", "点[直接上中文]或四国语言按钮翻译上屏")
                     }
                     setMicrophoneAppearance(recording = false, enabled = true)
                 }
@@ -540,34 +770,12 @@ class VoiceInputMethodService : InputMethodService() {
     }
 
     private fun commitSegment(text: String, recognitionInputSession: Long, generation: Long) {
-        if (generation != recordingGeneration) {
-            Log.w(TAG, "COMMIT_FAILED reason=recording_changed textLength=${text.length}")
-            return
-        }
+        if (generation != recordingGeneration) return
         recognizedSegments++
-        if (!inputViewActive || recognitionInputSession != inputSession) {
-            Log.w(TAG, "COMMIT_FAILED reason=input_session_changed textLength=${text.length}")
-            showStatus(text(R.string.status_result_not_committed), text(R.string.status_result_not_committed_hint))
-            return
-        }
-
-        val inputConnection = currentInputConnection
-        if (inputConnection == null) {
-            Log.w(TAG, "COMMIT_FAILED reason=no_input_connection textLength=${text.length}")
-            showStatus(text(R.string.status_result_not_committed), text(R.string.status_result_not_committed_hint))
-            return
-        }
-
-        val committed = runCatching { inputConnection.commitText(text, 1) }
-            .onFailure { Log.e(TAG, "COMMIT_FAILED reason=exception textLength=${text.length}", it) }
-            .getOrDefault(false)
-        if (committed) {
-            committedSegments++
-            Log.i(TAG, "COMMIT_SUCCESS textLength=${text.length}")
-        } else {
-            Log.w(TAG, "COMMIT_FAILED reason=rejected textLength=${text.length}")
-            showStatus(text(R.string.status_result_not_committed), text(R.string.status_result_not_committed_hint))
-        }
+        if (!inputViewActive || recognitionInputSession != inputSession) return
+        draftBuffer.append(text)
+        updateDraftView()
+        committedSegments++
     }
 
     private fun onAsrFailure(error: Throwable, generation: Long) {
@@ -610,8 +818,6 @@ class VoiceInputMethodService : InputMethodService() {
 
     private fun text(id: Int, vararg args: Any): String = uiContext().getString(id, *args)
 
-    // Title is the state, hint is the next action. Busy states show a gray sheen in the detail slot instead.
-    // Both views stay laid out (INVISIBLE, not GONE) so the panel height never changes.
     private fun showStatus(title: String, hint: String? = null, busy: Boolean = false) {
         if (!viewsInitialized()) return
         statusView.text = title
@@ -681,10 +887,12 @@ class VoiceInputMethodService : InputMethodService() {
         checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
 
     private fun openPermissionActivity() {
-        startActivity(Intent(this, SettingsActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            putExtra(SettingsActivity.EXTRA_REQUEST_MICROPHONE_PERMISSION, true)
-        })
+        startActivity(
+            Intent(this, SettingsActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra(SettingsActivity.EXTRA_REQUEST_MICROPHONE_PERMISSION, true)
+            },
+        )
     }
 
     private companion object {

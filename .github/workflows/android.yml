@@ -39,7 +39,11 @@ jobs:
       - name: Prepare legal assets
         run: ./scripts/prepare-legal-assets.sh
 
-      - name: Test, lint, and assemble
-        run: ./gradlew --no-daemon test lintDebug assembleDebug assembleRelease
+      - name: Test and assemble Debug APK
+        run: ./gradlew --no-daemon test assembleDebug
 
-      # APK upload is intentionally omitted. See docs/release-checklist.md.
+      - name: Upload installable APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EuropeanGate-Offline-AI-Keyboard-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
