@@ -61,3 +61,6 @@ p = root/'app/build.gradle.kts'
 s = p.read_text().replace('versionCode = 11','versionCode = 12').replace('versionName = "0.2.2-eg"','versionName = "0.3.0-eg-preview"')
 p.write_text(s, encoding='utf-8')
 print('Applied EG preview-first UI and language rules; device accuracy tests still required.')
+
+import runpy
+runpy.run_path(str(root / 'scripts/apply-draft-editor.py'), run_name='__main__')
