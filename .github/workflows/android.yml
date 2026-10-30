@@ -13,14 +13,12 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
-      - name: Start audit record
-        shell: bash
+      - name: Record candidate provenance
         run: |
           mkdir -p audit
           printf 'Commit: %s\nRun: %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > audit/provenance.txt
-          printf '%s\n' 'DEBUG TEST BUILD. Not approved for installation.' 'Signature verification is not a malware verdict.' 'ClamAV is one scanner; a clean result does not guarantee safety or resolve Google Safe Browsing.' 'APK distribution is paused. No APK is uploaded by this workflow.' > audit/LIMITATIONS.txt
+          printf '%s\n' 'DEBUG TEST BUILD, not a production release.' 'A clean ClamAV scan and valid signature do not guarantee safety or resolve Chrome Safe Browsing warnings.' 'Do not disable or bypass browser or phone protections. If blocked, stop and investigate.' 'Debug signing identity may differ from the installed version. Do not uninstall the old app without backing up local data.' > audit/LIMITATIONS.txt
       - name: Validate and apply feature patch
-        shell: bash
         run: |
           set -o pipefail
           python3 -m py_compile scripts/apply-eg-upgrade.py
@@ -34,29 +32,23 @@ jobs:
         with:
           validate-wrappers: true
           cache-provider: basic
-      - name: Prepare ASR inputs
-        shell: bash
+      - name: Prepare inputs
         run: |
           set -o pipefail
           ./scripts/prepare-local-asr.sh 2>&1 | tee audit/asr-inputs.log
-      - name: Prepare legal assets
-        run: ./scripts/prepare-legal-assets.sh
-      - name: Build audit candidate
-        shell: bash
+          ./scripts/prepare-legal-assets.sh
+      - name: Build candidate
         run: |
           set -o pipefail
           ./gradlew --no-daemon assembleDebug --stacktrace 2>&1 | tee audit/build.log
           ./gradlew --no-daemon :app:dependencies --configuration debugRuntimeClasspath > audit/dependencies.txt 2>&1
-      - name: Inspect final APK and enforce permission allowlist
-        shell: bash
+      - name: Verify signature and final permissions
         run: |
           set -euo pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           test -n "$SDK"
           TOOLS=$(find "$SDK/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
-          test -x "$TOOLS/apksigner"
-          test -x "$TOOLS/aapt"
           sha256sum "$APK" > audit/apk-sha256.txt
           "$TOOLS/apksigner" verify --verbose --print-certs "$APK" > audit/signature.txt 2>&1
           "$TOOLS/aapt" dump permissions "$APK" > audit/permissions.txt
@@ -70,15 +62,11 @@ jobs:
           requested = set(re.findall(r"uses-permission[^:]*: name='([^']+)'", text))
           allowed = {'android.permission.RECORD_AUDIO', 'com.fcitx5sensevoice.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'}
           unexpected = requested - allowed
-          report = 'Requested permissions: ' + repr(sorted(requested)) + '\nUnexpected permissions: ' + repr(sorted(unexpected))
-          Path('audit/permission-gate.txt').write_text(report)
-          if 'android.permission.RECORD_AUDIO' not in requested:
-              raise SystemExit('Microphone permission missing or permission parser failed; manual review required')
-          if unexpected:
-              raise SystemExit('Unexpected permissions; stop distribution and review')
+          Path('audit/permission-gate.txt').write_text('Requested permissions: ' + repr(sorted(requested)) + '\nUnexpected permissions: ' + repr(sorted(unexpected)))
+          if 'android.permission.RECORD_AUDIO' not in requested or unexpected:
+              raise SystemExit('Permission verification failed; no APK download will be produced.')
           PY
-      - name: Install scanner and update definitions
-        shell: bash
+      - name: Update scanner definitions
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -86,46 +74,62 @@ jobs:
           sudo systemctl stop clamav-freshclam.service || true
           sudo freshclam 2>&1 | tee audit/scanner-update.log
           clamscan --version > audit/scanner-version.txt
-      - name: Rescan with longer timeout and strict completion gate
-        shell: bash
+      - name: Scan and reject incomplete results
         timeout-minutes: 20
         run: |
           set -uo pipefail
-          printf '%s\n' 'bytecode enabled; bytecode timeout 120000ms; per-file scan timeout 600000ms; no rules disabled' > audit/scan-options.txt
+          printf '%s\n' 'bytecode enabled; timeout 120000ms; per-file limit 600000ms; no rules disabled' > audit/scan-options.txt
           set +e
           clamscan --bytecode=yes --bytecode-timeout=120000 --max-scantime=600000 --scan-archive=yes --alert-exceeds-max=yes --max-filesize=1024M --max-scansize=2048M --max-recursion=30 app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee audit/clamav.txt
           codes=("${PIPESTATUS[@]}")
           set -e
           printf 'ClamAV exit: %s\nLog writer exit: %s\n' "${codes[0]}" "${codes[1]}" > audit/scan-gate.txt
           if (( codes[0] != 0 || codes[1] != 0 )); then
-            echo 'NOT PASSED: scanner or log capture failed; see clamav.txt' >> audit/scan-gate.txt
+            echo 'NOT PASSED: scanner or log capture failed.' >> audit/scan-gate.txt
             exit 1
           fi
           if grep -Ein 'warning|timed out|timeout|exceeded|failed to run|error|skipp|not scanned|Heuristics\.Limits' audit/clamav.txt > audit/scan-warnings.txt; then
-            echo 'NOT PASSED: warning or incomplete scan requires review, even if summary says OK.' >> audit/scan-gate.txt
+            echo 'NOT PASSED: warning or incomplete scan.' >> audit/scan-gate.txt
             exit 1
           fi
           if ! grep -Eq '^Infected files: *0 *$' audit/clamav.txt; then
             echo 'NOT PASSED: expected scan summary missing.' >> audit/scan-gate.txt
             exit 1
           fi
-          echo 'Scanner completion gate passed. This is NOT installation approval or a Google Safe Browsing verdict.' >> audit/scan-gate.txt
+          echo 'Scanner completion gate passed. Not a guarantee of safety or a Google verdict.' >> audit/scan-gate.txt
       - name: Run unit tests
-        shell: bash
         run: |
           set -o pipefail
           ./gradlew --no-daemon testDebugUnitTest --stacktrace 2>&1 | tee audit/tests.log
-      - name: Summarize audit status
+      - name: Package exact checked candidate
+        run: |
+          set -euo pipefail
+          sha256sum --check audit/apk-sha256.txt
+          mkdir -p test-download
+          cp app/build/outputs/apk/debug/app-debug.apk test-download/
+          cp audit/signature.txt audit/scan-gate.txt audit/clamav.txt audit/permission-gate.txt audit/provenance.txt audit/LIMITATIONS.txt test-download/
+          cd test-download
+          sha256sum app-debug.apk > SHA256SUMS.txt
+      - name: Offer checked test APK for download
+        id: apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: EuropeanGate-Offline-AI-Keyboard-APK
+          path: test-download/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Summarize results
         if: always()
-        shell: bash
         env:
           AUDIT_STATUS: ${{ job.status }}
+          APK_DOWNLOAD: ${{ steps.apk.outputs.artifact-url }}
         run: |
-          printf '## APK audit\n\nCommit: `%s`\n\nStatus: %s\n\nAPK distribution remains paused. A clean scan does not resolve the Chrome warning.\n' "$GITHUB_SHA" "$AUDIT_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          printf '## APK test candidate\n\nCommit: `%s`\n\nStatus: %s\n\nThis remains a Debug test build. Checks do not remove or overrule Chrome warnings. Do not disable security protections.\n' "$GITHUB_SHA" "$AUDIT_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          if test -n "$APK_DOWNLOAD"; then printf '\n[Test APK and verification files](%s)\n' "$APK_DOWNLOAD" >> "$GITHUB_STEP_SUMMARY"; fi
           for f in permission-gate.txt scan-gate.txt scan-warnings.txt apk-sha256.txt; do
             if test -f "audit/$f"; then printf '\n### %s\n\n' "$f" >> "$GITHUB_STEP_SUMMARY"; cat "audit/$f" >> "$GITHUB_STEP_SUMMARY"; printf '\n' >> "$GITHUB_STEP_SUMMARY"; fi
           done
-      - name: Upload text audit evidence only
+      - name: Upload audit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
