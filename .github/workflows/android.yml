@@ -9,12 +9,23 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3
-      - name: Apply reviewed EG upgrade
-        run: python3 scripts/apply-eg-upgrade.py
+      - name: Start audit record
+        shell: bash
+        run: |
+          mkdir -p audit
+          printf 'Commit: %s\nRun: %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > audit/provenance.txt
+          printf '%s\n' 'DEBUG TEST BUILD. Not approved for installation.' 'Signature verification is not a malware verdict.' 'ClamAV is one scanner; a clean result does not guarantee safety or resolve Google Safe Browsing.' 'APK distribution is paused. No APK is uploaded by this workflow.' > audit/LIMITATIONS.txt
+      - name: Validate and apply feature patch
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 -m py_compile scripts/apply-eg-upgrade.py
+          python3 scripts/apply-eg-upgrade.py 2>&1 | tee audit/patch.log
+          git diff -- app > audit/applied-source.diff
       - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165
         with:
           distribution: jetbrains
@@ -23,23 +34,83 @@ jobs:
         with:
           validate-wrappers: true
           cache-provider: basic
-      - run: ./scripts/prepare-local-asr.sh
-      - run: ./scripts/prepare-legal-assets.sh
-      - name: Assemble Debug APK
+      - name: Prepare ASR inputs
         shell: bash
         run: |
           set -o pipefail
-          ./gradlew --no-daemon assembleDebug --stacktrace 2>&1 | tee build.log
-      - name: Upload build log
+          ./scripts/prepare-local-asr.sh 2>&1 | tee audit/asr-inputs.log
+      - name: Prepare legal assets
+        run: ./scripts/prepare-legal-assets.sh
+      - name: Build audit candidate
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon assembleDebug --stacktrace 2>&1 | tee audit/build.log
+          ./gradlew --no-daemon :app:dependencies --configuration debugRuntimeClasspath > audit/dependencies.txt 2>&1
+      - name: Inspect final APK and enforce permission allowlist
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK"
+          TOOLS=$(find "$SDK/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          test -x "$TOOLS/apksigner"
+          test -x "$TOOLS/aapt"
+          sha256sum "$APK" > audit/apk-sha256.txt
+          "$TOOLS/apksigner" verify --verbose --print-certs "$APK" > audit/signature.txt 2>&1
+          "$TOOLS/aapt" dump permissions "$APK" > audit/permissions.txt
+          "$TOOLS/aapt" dump badging "$APK" > audit/package.txt
+          "$TOOLS/aapt" dump xmltree "$APK" AndroidManifest.xml > audit/final-manifest.txt
+          unzip -l "$APK" > audit/apk-file-list.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path('audit/permissions.txt').read_text()
+          requested = set(re.findall(r"uses-permission[^:]*: name='([^']+)'", text))
+          allowed = {'android.permission.RECORD_AUDIO', 'com.fcitx5sensevoice.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'}
+          unexpected = requested - allowed
+          report = 'Requested permissions: ' + repr(sorted(requested)) + '\nUnexpected permissions: ' + repr(sorted(unexpected))
+          Path('audit/permission-gate.txt').write_text(report)
+          if 'android.permission.RECORD_AUDIO' not in requested:
+              raise SystemExit('Microphone permission missing or permission parser failed; manual review required')
+          if unexpected:
+              raise SystemExit('Unexpected permissions; stop distribution and review')
+          PY
+      - name: Install scanner and update definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam.service || true
+          sudo freshclam 2>&1 | tee audit/scanner-update.log
+          clamscan --version > audit/scanner-version.txt
+      - name: Scan APK locally on runner
+        shell: bash
+        run: |
+          set -o pipefail
+          clamscan --scan-archive=yes --alert-exceeds-max=yes --max-filesize=1024M --max-scansize=2048M --max-recursion=30 app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee audit/clamav.txt
+      - name: Run unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon testDebugUnitTest --stacktrace 2>&1 | tee audit/tests.log
+      - name: Summarize audit status
+        if: always()
+        shell: bash
+        env:
+          AUDIT_STATUS: ${{ job.status }}
+        run: |
+          printf '## APK audit\n\nCommit: `%s`\n\nStatus: %s\n\nAPK distribution remains paused. Download only EG-security-audit text reports. A successful build or clean scan is NOT approval to install and does not resolve the Chrome warning.\n' "$GITHUB_SHA" "$AUDIT_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          for f in permission-gate.txt apk-sha256.txt; do
+            if test -f "audit/$f"; then cat "audit/$f" >> "$GITHUB_STEP_SUMMARY"; printf '\n' >> "$GITHUB_STEP_SUMMARY"; fi
+          done
+      - name: Upload text audit evidence only
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: EG-build-log
-          path: build.log
-          if-no-files-found: ignore
-      - name: Upload installable APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: EuropeanGate-Offline-AI-Keyboard-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: EG-security-audit
+          path: audit/
           if-no-files-found: error
+          retention-days: 14
