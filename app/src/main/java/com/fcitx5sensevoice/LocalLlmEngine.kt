@@ -62,7 +62,7 @@ class LocalLlmEngine(private val context: Context) {
 
         val config = EngineConfig(
             modelPath = path,
-            backend = Backend.CPU(),
+            backend = Backend.GPU(),
             cacheDir = context.cacheDir.path,
         )
         val engine = Engine(config)
