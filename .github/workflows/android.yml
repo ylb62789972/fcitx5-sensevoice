@@ -66,6 +66,20 @@ jobs:
           if 'android.permission.RECORD_AUDIO' not in requested or unexpected:
               raise SystemExit('Permission verification failed; no APK download will be produced.')
           PY
+      - name: Run unit tests
+        id: tests
+        run: |
+          set -uo pipefail
+          set +e
+          ./gradlew --no-daemon testDebugUnitTest --stacktrace 2>&1 | tee audit/tests.log
+          codes=("${PIPESTATUS[@]}")
+          set -e
+          printf 'Gradle exit: %s\nLog writer exit: %s\n' "${codes[0]}" "${codes[1]}" > audit/test-gate.txt
+          if (( codes[0] != 0 || codes[1] != 0 )); then
+            echo 'NOT PASSED: unit test task or log capture failed.' >> audit/test-gate.txt
+            exit 1
+          fi
+          echo 'Gradle unit test task completed successfully; see XML reports for test counts.' >> audit/test-gate.txt
       - name: Update scanner definitions
         run: |
           set -euo pipefail
@@ -75,12 +89,15 @@ jobs:
           sudo freshclam 2>&1 | tee audit/scanner-update.log
           clamscan --version > audit/scanner-version.txt
       - name: Scan and reject incomplete results
+        id: scan
         timeout-minutes: 20
+        env:
+          LC_ALL: C
         run: |
           set -uo pipefail
-          printf '%s\n' 'bytecode enabled; timeout 120000ms; per-file limit 600000ms; no rules disabled' > audit/scan-options.txt
+          printf '%s\n' 'bytecode enabled; mode ForceJIT; timeout 120000ms; per-file limit 600000ms; no rules disabled' > audit/scan-options.txt
           set +e
-          clamscan --bytecode=yes --bytecode-timeout=120000 --max-scantime=600000 --scan-archive=yes --alert-exceeds-max=yes --max-filesize=1024M --max-scansize=2048M --max-recursion=30 app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee audit/clamav.txt
+          clamscan --bytecode=yes --bytecode-mode=ForceJIT --bytecode-timeout=120000 --max-scantime=600000 --scan-archive=yes --alert-exceeds-max=yes --max-filesize=1024M --max-scansize=2048M --max-recursion=30 app/build/outputs/apk/debug/app-debug.apk 2>&1 | tee audit/clamav.txt
           codes=("${PIPESTATUS[@]}")
           set -e
           printf 'ClamAV exit: %s\nLog writer exit: %s\n' "${codes[0]}" "${codes[1]}" > audit/scan-gate.txt
@@ -96,18 +113,18 @@ jobs:
             echo 'NOT PASSED: expected scan summary missing.' >> audit/scan-gate.txt
             exit 1
           fi
+          if ! grep -Eq '^Scanned files: *[1-9][0-9]* *$' audit/clamav.txt; then
+            echo 'NOT PASSED: no positive scanned-file count.' >> audit/scan-gate.txt
+            exit 1
+          fi
           echo 'Scanner completion gate passed. Not a guarantee of safety or a Google verdict.' >> audit/scan-gate.txt
-      - name: Run unit tests
-        run: |
-          set -o pipefail
-          ./gradlew --no-daemon testDebugUnitTest --stacktrace 2>&1 | tee audit/tests.log
       - name: Package exact checked candidate
         run: |
           set -euo pipefail
           sha256sum --check audit/apk-sha256.txt
           mkdir -p test-download
           cp app/build/outputs/apk/debug/app-debug.apk test-download/
-          cp audit/signature.txt audit/scan-gate.txt audit/clamav.txt audit/permission-gate.txt audit/provenance.txt audit/LIMITATIONS.txt test-download/
+          cp audit/signature.txt audit/scan-gate.txt audit/scan-options.txt audit/clamav.txt audit/test-gate.txt audit/permission-gate.txt audit/provenance.txt audit/LIMITATIONS.txt test-download/
           cd test-download
           sha256sum app-debug.apk > SHA256SUMS.txt
       - name: Offer checked test APK for download
@@ -122,18 +139,33 @@ jobs:
         if: always()
         env:
           AUDIT_STATUS: ${{ job.status }}
+          TEST_STATUS: ${{ steps.tests.outcome }}
+          SCAN_STATUS: ${{ steps.scan.outcome }}
           APK_DOWNLOAD: ${{ steps.apk.outputs.artifact-url }}
         run: |
-          printf '## APK test candidate\n\nCommit: `%s`\n\nStatus: %s\n\nThis remains a Debug test build. Checks do not remove or overrule Chrome warnings. Do not disable security protections.\n' "$GITHUB_SHA" "$AUDIT_STATUS" >> "$GITHUB_STEP_SUMMARY"
+          printf '## APK test candidate\n\nCommit: `%s`\n\nStatus: %s\n\nUnit test step: %s\n\nAPK scan step: %s\n\nThis remains a Debug test build. Checks do not remove or overrule Chrome warnings. Do not disable security protections.\n' "$GITHUB_SHA" "$AUDIT_STATUS" "$TEST_STATUS" "$SCAN_STATUS" >> "$GITHUB_STEP_SUMMARY"
           if test -n "$APK_DOWNLOAD"; then printf '\n[Test APK and verification files](%s)\n' "$APK_DOWNLOAD" >> "$GITHUB_STEP_SUMMARY"; fi
-          for f in permission-gate.txt scan-gate.txt scan-warnings.txt apk-sha256.txt; do
-            if test -f "audit/$f"; then printf '\n### %s\n\n' "$f" >> "$GITHUB_STEP_SUMMARY"; cat "audit/$f" >> "$GITHUB_STEP_SUMMARY"; printf '\n' >> "$GITHUB_STEP_SUMMARY"; fi
+          for f in permission-gate.txt test-gate.txt scan-options.txt scan-gate.txt scan-warnings.txt apk-sha256.txt; do
+            if test -f "audit/$f"; then printf '\n### %s\n\n```text\n' "$f" >> "$GITHUB_STEP_SUMMARY"; cat "audit/$f" >> "$GITHUB_STEP_SUMMARY"; printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"; fi
           done
+          if test "$TEST_STATUS" = failure && test -f audit/tests.log; then
+            printf '\n### Unit test failure log (last 100 lines)\n\n```text\n' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 100 audit/tests.log >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if test -f audit/clamav.txt; then
+            printf '\n### APK scan log (last 60 lines)\n\n```text\n' >> "$GITHUB_STEP_SUMMARY"
+            tail -n 60 audit/clamav.txt >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload audit evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: EG-security-audit
-          path: audit/
+          path: |
+            audit/
+            app/build/test-results/
+            app/build/reports/tests/
           if-no-files-found: error
           retention-days: 14
