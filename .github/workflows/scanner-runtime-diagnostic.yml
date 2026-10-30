@@ -1,0 +1,74 @@
+name: Scanner runtime diagnostic
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/scanner-runtime-diagnostic.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: scanner-runtime-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Record purpose and runner
+        run: |
+          mkdir -p diagnostic
+          printf '%s\n' 'DIAGNOSTICS ONLY. This job does not scan, approve or publish an APK.' 'An empty-file JIT probe only checks scanner runtime availability.' > diagnostic/README.txt
+          printf 'Commit: %s\nRun: %s\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" > diagnostic/provenance.txt
+          uname -a > diagnostic/kernel.txt
+          lscpu > diagnostic/cpu.txt
+          free -m > diagnostic/memory.txt
+      - name: Install same scanner from Ubuntu repositories
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam.service || true
+          sudo freshclam 2>&1 | tee diagnostic/database-update.txt
+          clamscan --version > diagnostic/version.txt
+          clamscan --help > diagnostic/help.txt
+          dpkg-query -W 'clamav*' 'libclamav*' > diagnostic/packages.txt
+      - name: Probe JIT without disabling bytecode checks
+        timeout-minutes: 5
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          import os
+          import subprocess
+          folder = Path('diagnostic')
+          fixture = folder / 'empty-probe.txt'
+          fixture.write_text('')
+          command = ['clamscan', '--bytecode=yes', '--bytecode-mode=ForceJIT', '--bytecode-timeout=120000', str(fixture)]
+          (folder / 'command.json').write_text(json.dumps(command, indent=2))
+          env = os.environ.copy()
+          env['LC_ALL'] = 'C'
+          try:
+              result = subprocess.run(command, capture_output=True, text=True, env=env, timeout=240)
+              log = result.stdout + result.stderr
+              code = result.returncode
+          except subprocess.TimeoutExpired as error:
+              def text(value):
+                  return value.decode(errors='replace') if isinstance(value, bytes) else (value or '')
+              log = text(error.stdout) + text(error.stderr) + '\nRuntime probe timed out after 240 seconds.\n'
+              code = 124
+          (folder / 'jit-probe.txt').write_text(log)
+          warning = any(term in log.lower() for term in ['warning', 'error', 'failed', 'timed out', 'not supported'])
+          status = 'JIT_PROBE_PASSED' if code == 0 and not warning else 'JIT_UNAVAILABLE_OR_PROBE_INCOMPLETE'
+          report = {'runtime_probe': status, 'exit_code': code, 'warning_seen': warning, 'apk_scanned': False, 'installation_approved': False}
+          (folder / 'result.json').write_text(json.dumps(report, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('## Scanner runtime diagnosis\n\nDiagnostics collection finished; this is not an APK safety result.\n\n```json\n' + json.dumps(report, indent=2) + '\n```\n\n### Probe log\n\n```text\n' + log[-12000:] + '\n```\n')
+          PY
+      - name: Upload diagnosis even when setup fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EG-scanner-runtime-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 7
